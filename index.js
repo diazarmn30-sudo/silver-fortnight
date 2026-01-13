@@ -1,16 +1,32 @@
 // KEEP ALIVE (wajib di Koyeb biar gak exit code 0)
 setInterval(() => {}, 1 << 30);
-console.log('Memulai bot...');
-const { Telegraf } = require('telegraf');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const pino = require('pino');
-const fs = require('fs');
-const axios = require('axios');
-const config = require('./config');
 
-const path = require('path');
+console.log("Memulai bot...");
+
+const { Telegraf } = require("telegraf");
+const makeWASocket = require("@whiskeysockets/baileys").default;
+const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const { Boom } = require("@hapi/boom");
+const pino = require("pino");
+const fs = require("fs");
+const axios = require("axios");
+const path = require("path");
+
+const config = require("./config");
+config.telegramBotToken = String(config.telegramBotToken || "").trim();
+
+console.log("[DBG] TG token length:", config.telegramBotToken.length);
+console.log("[DBG] TG token head:", config.telegramBotToken.slice(0, 12));
+console.log("[DBG] TG token tail:", config.telegramBotToken.slice(-6));
+
+(async () => {
+  try {
+    const r = await axios.get(`https://api.telegram.org/bot${config.telegramBotToken}/getMe`);
+    console.log("[DBG] getMe ok:", r.data?.ok, "username:", r.data?.result?.username);
+  } catch (e) {
+    console.log("[DBG] getMe failed:", e?.response?.status, e?.response?.data || e.message);
+  }
+})();
 
 const DATA_DIR = process.env.DATA_DIR || '.';
 const premiumPath = path.join(DATA_DIR, 'premium.json');
