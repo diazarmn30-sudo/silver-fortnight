@@ -8,7 +8,10 @@ const fs = require('fs');
 const axios = require('axios');
 const config = require('./config');
 
-const premiumPath = './premium.json';
+const path = require('path');
+
+const DATA_DIR = process.env.DATA_DIR || '.';
+const premiumPath = path.join(DATA_DIR, 'premium.json');
 
 const getPremiumUsers = () => { try { return JSON.parse(fs.readFileSync(premiumPath)); } catch (e) { fs.writeFileSync(premiumPath, '[]'); return []; } };
 const savePremiumUsers = (users) => { fs.writeFileSync(premiumPath, JSON.stringify(users, null, 2)); };
@@ -19,7 +22,7 @@ let waConnectionStatus = 'closed';
 
 async function startWhatsAppClient() {
     console.log("Mencoba memulai koneksi WhatsApp...");
-    const { state, saveCreds } = await useMultiFileAuthState(config.sessionName);
+    const { state, saveCreds } = await useMultiFileAuthState(path.join(DATA_DIR, config.sessionName));
     
     waClient = makeWASocket({
         logger: pino({ level: 'silent' }),
@@ -239,10 +242,17 @@ bot.command('listallakses', checkAccess('owner'), (ctx) => {
 });
 
 (async () => {
-    await startWhatsAppClient();
-    bot.launch();
-    console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
-})();
+  await startWhatsAppClient();
+
+  await bot.launch();
+  console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
+
+  // keep process alive (biar Koyeb gak anggap mati)
+  setInterval(() => {}, 1 << 30);
+})().catch((e) => {
+  console.error("FATAL:", e);
+  process.exit(1);
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
