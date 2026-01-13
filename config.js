@@ -1,0 +1,24 @@
+module.exports = {
+    
+    ownerId: 5966985421, // ID LU
+    
+    telegramBotToken: "8328012642:AAHRM13n6PjO1Yo_e7_yT6XAcFX34kRpRiM",
+    sessionName: "session",
+
+
+    photoStart: "https://files.catbox.moe/mqf20e.jpg",
+
+    message: {
+        owner: `🚫 Cuma yaz yang bisa, bos!`,
+        premium: `💎 Khusus member premium, bos!`,
+        wait: `⏳ Otw yaz, sabar ya...`,
+        error: `⚠️ Anjir, error yaz. Coba lagi ntar.`,
+        waNotConnected: `⚠️ Waduh, WA-nya belum nyambung yaz. /pairing dulu lah.`
+    },
+
+    settings: {
+        namabot: "Cek Bio By yaz",
+        footer: "Powered By yaz",
+        cekBioBatchSize: 30 // Jumlah nomor yang dicek bersamaan.
+    }
+};
