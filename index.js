@@ -13,14 +13,7 @@ const config = require('./config');
 const path = require('path');
 
 const DATA_DIR = process.env.DATA_DIR || '.';
-const getPremiumUsers = () => {
-  try {
-    return JSON.parse(fs.readFileSync(premiumPath, 'utf8'));
-  } catch (e) {
-    fs.writeFileSync(premiumPath, '[]');
-    return [];
-  }
-};
+const premiumPath = path.join(DATA_DIR, 'premium.json');
 
 const getPremiumUsers = () => {
   try {
