@@ -1,7 +1,5 @@
-// index.js — FULL (fitur tetap sama) + startup model “script contoh” (anti-loop Koyeb)
-// Inti perubahan cuma: STARTUP pakai retry (kalau bot.launch gagal), bukan bikin proses selesai.
-//
-// NOTE: paling aman simpan token di env BOT_TOKEN (Koyeb Secret). Kalau tidak ada, fallback ke config.js.
+// index.js — FULL (fitur tetap) + anti-exit Koyeb (ga bakal exit code 0)
+// Pakai ENV di Koyeb (Secrets): BOT_TOKEN dan (opsional) DATA_DIR=/data
 
 'use strict';
 
@@ -18,16 +16,19 @@ const path = require("path");
 
 const config = require("./config");
 
-// === TOKEN (env lebih prioritas) ===
+// === TOKEN (ENV lebih prioritas) ===
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || "").trim();
 if (!BOT_TOKEN) {
-  console.error("TOKEN BOT Telegram kosong. Set env BOT_TOKEN atau isi config.telegramBotToken.");
+  console.error("TOKEN BOT Telegram kosong. Set BOT_TOKEN di Koyeb Secrets atau isi config.telegramBotToken.");
   process.exit(1);
 }
 
 // === DATA DIR (Koyeb volume: /data) ===
 const DATA_DIR = process.env.DATA_DIR || ".";
 const premiumPath = path.join(DATA_DIR, "premium.json");
+
+// keep-alive (WAJIB supaya gak exit code 0)
+setInterval(() => {}, 1 << 30);
 
 // === Premium helpers ===
 const getPremiumUsers = () => {
@@ -294,28 +295,23 @@ bot.command("listallakses", checkAccess("owner"), (ctx) => {
   return ctx.reply(text, { parse_mode: "Markdown" });
 });
 
-// === STARTUP (model script contoh): gagal -> retry, jadi Koyeb nggak loop exit 0 ===
-async function startBot() {
+// === STARTUP (WAJIB) ===
+(async () => {
+  await startWhatsAppClient();
+
   try {
-    await startWhatsAppClient();
-
     await bot.launch();
-    console.log("🤖 Bot Telegram berhasil dijalankan!");
-    console.log("𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!");
-
-    process.once("SIGINT", () => bot.stop("SIGINT"));
-    process.once("SIGTERM", () => bot.stop("SIGTERM"));
-  } catch (error) {
-    const msg =
-      error?.response?.description ||
-      error?.description ||
-      error?.message ||
-      String(error);
-
-    console.error("Failed to start bot:", msg);
-    console.log("Retry startBot() in 10s...");
-    setTimeout(startBot, 10_000); // ini nahan event-loop => gak exit code 0
+    console.log("Telegram bot launched");
+  } catch (e) {
+    const msg = e?.response?.description || e?.message || String(e);
+    console.error("Telegraf launch error:", msg);
   }
-}
 
-startBot();
+  console.log("𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!");
+})().catch((e) => {
+  console.error("FATAL:", e);
+  process.exit(1);
+});
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM")); 
