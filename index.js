@@ -1,6 +1,3 @@
-// index.js — FULL (fitur tetap) + anti-exit Koyeb (ga bakal exit code 0)
-// Pakai ENV di Koyeb (Secrets): BOT_TOKEN dan (opsional) DATA_DIR=/data
-
 'use strict';
 
 console.log("Memulai bot...");
@@ -13,24 +10,42 @@ const pino = require("pino");
 const fs = require("fs");
 const axios = require("axios");
 const path = require("path");
+const http = require("http");
 
 const config = require("./config");
 
-// === TOKEN (ENV lebih prioritas) ===
+// ==========================
+// HEALTH SERVER (BIAR KOYEB GA NGIRA APP MATI)
+// ==========================
+const PORT = Number(process.env.PORT || 8000);
+http.createServer((req, res) => {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("ok");
+}).listen(PORT, () => {
+  console.log("[HEALTH] listening on", PORT);
+});
+
+// ==========================
+// TOKEN (ENV PRIORITAS)
+// ==========================
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || "").trim();
 if (!BOT_TOKEN) {
   console.error("TOKEN BOT Telegram kosong. Set BOT_TOKEN di Koyeb Secrets atau isi config.telegramBotToken.");
   process.exit(1);
 }
 
-// === DATA DIR (Koyeb volume: /data) ===
+// ==========================
+// DATA DIR (Koyeb volume: /data) - optional
+// ==========================
 const DATA_DIR = process.env.DATA_DIR || ".";
 const premiumPath = path.join(DATA_DIR, "premium.json");
 
-// keep-alive (WAJIB supaya gak exit code 0)
+// Keep-alive ekstra (ga wajib karena ada server, tapi aman)
 setInterval(() => {}, 1 << 30);
 
-// === Premium helpers ===
+// ==========================
+// Premium helpers
+// ==========================
 const getPremiumUsers = () => {
   try {
     return JSON.parse(fs.readFileSync(premiumPath, "utf8"));
@@ -46,7 +61,9 @@ const savePremiumUsers = (users) => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// === WhatsApp client ===
+// ==========================
+// WhatsApp client
+// ==========================
 let waClient = null;
 let waConnectionStatus = "closed";
 
@@ -90,7 +107,9 @@ async function startWhatsAppClient() {
   });
 }
 
-// === Core cek bio ===
+// ==========================
+// Core cek bio
+// ==========================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== "open") {
     return ctx.reply(config.message?.waNotConnected || "WA belum nyambung. /pairing dulu.", {
@@ -179,7 +198,9 @@ async function handleBioCheck(ctx, numbersToCheck) {
   fs.unlinkSync(filePath);
 }
 
-// === Telegram bot + fitur tetap ===
+// ==========================
+// Telegram bot
+// ==========================
 const bot = new Telegraf(BOT_TOKEN);
 
 const checkAccess = (level) => async (ctx, next) => {
@@ -295,7 +316,9 @@ bot.command("listallakses", checkAccess("owner"), (ctx) => {
   return ctx.reply(text, { parse_mode: "Markdown" });
 });
 
-// === STARTUP (WAJIB) ===
+// ==========================
+// Startup
+// ==========================
 (async () => {
   await startWhatsAppClient();
 
@@ -314,4 +337,4 @@ bot.command("listallakses", checkAccess("owner"), (ctx) => {
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM")); 
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
