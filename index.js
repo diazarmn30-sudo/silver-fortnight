@@ -13,7 +13,14 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || '.';
 const premiumPath = path.join(DATA_DIR, 'premium.json');
 
-const getPremiumUsers = () => { try { return JSON.parse(fs.readFileSync(premiumPath)); } catch (e) { fs.writeFileSync(premiumPath, '[]'); return []; } };
+const getPremiumUsers = () => {
+  try {
+    return JSON.parse(fs.readFileSync(premiumPath, 'utf8'));
+  } catch (e) {
+    fs.writeFileSync(premiumPath, '[]');
+    return [];
+  }
+};
 const savePremiumUsers = (users) => { fs.writeFileSync(premiumPath, JSON.stringify(users, null, 2)); };
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -154,6 +161,7 @@ const checkAccess = (level) => async (ctx, next) => {
 };
 
 bot.command('start', (ctx) => {
+    const premiumStatus = "ON"; // atau isi sesuai logic kamu
     const userName = ctx.from.first_name;
     const caption = `🕊 *(!) Holà ${userName}!*
 Gw siap bantu lu cek bio & info WhatsApp.
