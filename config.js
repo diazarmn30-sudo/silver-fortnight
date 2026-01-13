@@ -2,7 +2,7 @@ module.exports = {
     
     ownerId: 5966985421, // ID LU
     
-    telegramBotToken: "8556755989:AAGP_v6A8dWIkqtOede0fUcVdJpzBWkdS1w",
+    telegramBotToken: "8328012642:AAFh-d1fPCYldgRjdoa7NqpFGXph9rUG1rc",
     sessionName: "session",
 
 
