@@ -244,13 +244,22 @@ bot.command('listallakses', checkAccess('owner'), (ctx) => {
 (async () => {
   await startWhatsAppClient();
 
-  await bot.launch();
+  try {
+    await bot.launch();
+    console.log("Telegram bot launched");
+  } catch (e) {
+    // INI PENTING: jangan biarkan error 409 bikin proses mati
+    const msg = e?.response?.description || e?.message || String(e);
+    console.error("Telegraf launch error:", msg);
+  }
+
   console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
 
-  // keep process alive (biar Koyeb gak anggap mati)
+  // WAJIB: tahan process biar Koyeb gak restart karena exit code 0
   setInterval(() => {}, 1 << 30);
 })().catch((e) => {
   console.error("FATAL:", e);
+  // kalau fatal beneran, baru exit 1
   process.exit(1);
 });
 
