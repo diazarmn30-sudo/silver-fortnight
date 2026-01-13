@@ -1,3 +1,5 @@
+// KEEP ALIVE (wajib di Koyeb biar gak exit code 0)
+setInterval(() => {}, 1 << 30);
 console.log('Memulai bot...');
 const { Telegraf } = require('telegraf');
 const makeWASocket = require('@whiskeysockets/baileys').default;
@@ -11,7 +13,14 @@ const config = require('./config');
 const path = require('path');
 
 const DATA_DIR = process.env.DATA_DIR || '.';
-const premiumPath = path.join(DATA_DIR, 'premium.json');
+const getPremiumUsers = () => {
+  try {
+    return JSON.parse(fs.readFileSync(premiumPath, 'utf8'));
+  } catch (e) {
+    fs.writeFileSync(premiumPath, '[]');
+    return [];
+  }
+};
 
 const getPremiumUsers = () => {
   try {
@@ -256,20 +265,12 @@ bot.command('listallakses', checkAccess('owner'), (ctx) => {
     await bot.launch();
     console.log("Telegram bot launched");
   } catch (e) {
-    // INI PENTING: jangan biarkan error 409 bikin proses mati
     const msg = e?.response?.description || e?.message || String(e);
     console.error("Telegraf launch error:", msg);
   }
 
   console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
-
-  // WAJIB: tahan process biar Koyeb gak restart karena exit code 0
-  setInterval(() => {}, 1 << 30);
 })().catch((e) => {
   console.error("FATAL:", e);
-  // kalau fatal beneran, baru exit 1
   process.exit(1);
 });
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
