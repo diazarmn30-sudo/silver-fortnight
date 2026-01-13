@@ -1,19 +1,15 @@
 FROM node:20-alpine
 
-WORKDIR /app
-
-# WAJIB: git (karena ada dependency dari github/git)
+# wajib untuk dependency github:... (npm butuh git)
 RUN apk add --no-cache git
 
-COPY package*.json ./
+WORKDIR /app
 
-# rekomendasi npm modern
+COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY . .
 
-RUN mkdir -p /data
-ENV DATA_DIR=/data
-ENV TZ=Asia/Jakarta
+ENV NODE_ENV=production
 
-CMD ["npm", "start"]
+CMD ["node", "index.js"]
