@@ -8,10 +8,8 @@
  *    1) /cekbio 628xx 62xx...
  *    2) reply .txt + /cekbio
  *    3) upload .txt with caption /cekbio
- * - Realtime progress output:
- *    - message "progress" di Telegram akan di-edit berkala (sedang batch ke berapa, found bio, no bio, not registered)
- *    - rate-limit biar ga spam edit
- * - Telegraf polling: dropPendingUpdates + graceful shutdown
+ * - Realtime progress output (editMessageText)
+ * - Anti loop: optional BLOCK_EXIT=1 (block process.exit(0))
  */
 
 const fs = require('fs');
@@ -34,11 +32,22 @@ console.log('[BOOT] file:', __filename);
 console.log('[BOOT] cwd :', process.cwd());
 try { console.log('[BOOT] ls  :', fs.readdirSync('.').slice(0, 50)); } catch {}
 
-process.on('SIGTERM', () => console.log('[SIGNAL] SIGTERM received (platform stopping container)'));
-process.on('SIGINT', () => console.log('[SIGNAL] SIGINT received'));
 process.on('uncaughtException', (e) => console.log('[UNCAUGHT]', e));
 process.on('unhandledRejection', (e) => console.log('[UNHANDLED]', e));
 process.on('exit', (code) => console.log('[EXIT] code =', code));
+
+// =======================
+// OPTIONAL: BLOCK EXIT (anti loop)
+// =======================
+const BLOCK_EXIT = String(process.env.BLOCK_EXIT || '').trim() === '1';
+const _exit = process.exit.bind(process);
+process.exit = (code = 0) => {
+  if (BLOCK_EXIT && Number(code) === 0) {
+    console.log('[BLOCK_EXIT] process.exit(', code, ') blocked');
+    return;
+  }
+  return _exit(code);
+};
 
 // =======================
 // KEEPALIVE
@@ -47,15 +56,14 @@ process.stdin.resume();
 setInterval(() => console.log('[HB] alive', new Date().toISOString()), 15000);
 
 // =======================
-// HEALTH SERVER (wajib di Koyeb biar dianggap "alive")
+// HEALTH SERVER (biar dianggap "alive")
 // =======================
 const PORT = Number(process.env.PORT || 8000);
-http.createServer((req, res) => {
+const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'text/plain' });
   res.end('ok');
-}).listen(PORT, '0.0.0.0', () => {
-  console.log('[HEALTH] listening on', PORT);
 });
+healthServer.listen(PORT, '0.0.0.0', () => console.log('[HEALTH] listening on', PORT));
 
 // =======================
 // ENV (ENV > config)
@@ -63,7 +71,7 @@ http.createServer((req, res) => {
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || '').trim();
 const OWNER_ID = Number(process.env.OWNER_ID || config.ownerId || 0);
 
-// kalau pakai Volume di Koyeb: mount path /data lalu set DATA_DIR=/data
+// Persistent Volume Koyeb: mount /data lalu set DATA_DIR=/data
 const DATA_DIR = String(process.env.DATA_DIR || '.').trim();
 const SESSION_NAME = String(process.env.SESSION_NAME || config.sessionName || 'session').trim();
 
@@ -93,7 +101,7 @@ function writeJsonSafe(file, data) {
 }
 
 // =======================
-// PREMIUM STORAGE (persistent kalau DATA_DIR ke /data)
+// PREMIUM STORAGE
 // =======================
 const premiumPath = path.join(DATA_DIR, 'premium.json');
 const getPremiumUsers = () => readJsonSafe(premiumPath, []);
@@ -170,7 +178,6 @@ function fmt(n) {
 }
 
 function escapeMd(text) {
-  // minimal escape Markdown untuk safe editMessageText
   return String(text || '')
     .replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
@@ -215,7 +222,6 @@ async function updateProgress(ctx, p, text, force = false) {
       { parse_mode: 'Markdown' }
     );
   } catch (e) {
-    // kalau edit gagal (misal message terlalu lama / rate limit), yaudah skip
     console.log('[PROGRESS] edit fail:', e?.response?.description || e?.message || e);
   }
 }
@@ -227,7 +233,7 @@ async function endProgress(ctx, p, text) {
 }
 
 // =======================
-// BIO CHECK CORE (dengan realtime output)
+// BIO CHECK CORE
 // =======================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== 'open' || !waClient) {
@@ -244,7 +250,6 @@ async function handleBioCheck(ctx, numbersToCheck) {
   let noBio = [];
   let notRegistered = [];
 
-  // cleanup dupes
   const uniqueNums = Array.from(new Set(numbersToCheck.map((x) => String(x).trim()).filter(Boolean)));
 
   await updateProgress(
@@ -343,12 +348,10 @@ async function handleBioCheck(ctx, numbersToCheck) {
     );
 
     // delay kecil biar WA ga kebakar
-    await sleep(50);
+    // NOTE: kamu tanya ganti 100 -> boleh, tapi makin kecil makin rawan flood/limit
+    await sleep(Number(config.settings?.cekBioDelayMs || 50));
   }
 
-  // =======================
-  // OUTPUT FILE
-  // =======================
   await updateProgress(
     ctx, p,
     `🧾 *CekBio finishing*\n` +
@@ -490,7 +493,7 @@ bot.command('cekbio', checkAccess('premium'), async (ctx) => {
   }
 });
 
-// alias lama (kalau mau tetap ada)
+// alias lama (opsional)
 bot.command('cekbiotxt', checkAccess('premium'), async (ctx) => {
   const replied = ctx.message?.reply_to_message;
   if (!replied?.document) return ctx.reply('Reply file .txt dulu.');
@@ -549,12 +552,17 @@ startAll().catch((e) => {
 });
 
 // Stop bersih (biar polling berhenti sebelum instance baru start)
+let shuttingDown = false;
 async function gracefulShutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('[SHUTDOWN] start by', sig);
   try { bot.stop(sig); } catch {}
   try { waClient?.end?.(); } catch {}
+  try { healthServer.close?.(); } catch {}
   await sleep(800);
   console.log('[SHUTDOWN] done');
+  // NOTE: exit(0) sengaja TIDAK dipaksa kalau BLOCK_EXIT=1 buat anti loop.
   process.exit(0);
 }
 
