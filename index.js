@@ -1,10 +1,12 @@
 'use strict';
 
 /**
- * index.js (FIXED & OPTIMIZED FOR KOYEB)
- * - Improved Health Check Handling
- * - Fixed Startup Logic (No more silent fails)
- * - Robust Error Handling
+ * index.js - FIXED VERSION FOR KOYEB
+ * Features:
+ * - Auto-Fix Session (Delete session if 401/Logout)
+ * - Koyeb Health Check Server (Port 8000)
+ * - Telegraf + Baileys Integration
+ * - Pairing Code Support
  */
 
 const fs = require('fs');
@@ -18,302 +20,287 @@ const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/bai
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 
-// Config Fallback (Buat jaga-jaga kalau file config ga ada)
+// ==========================================
+// CONFIG & ENVIRONMENT
+// ==========================================
+// Fallback config file jika ada
 let config = {};
 try { config = require('./config'); } catch { config = {}; }
 
-// =======================
-// ENV & CONSTANTS
-// =======================
-// Default port 8000. Pastikan di Koyeb Settings -> Instance -> Port diisi 8000
-const PORT = Number(process.env.PORT || 8000); 
+// Environment Variables (Set di Koyeb)
+const PORT = Number(process.env.PORT || 8000);
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || '').trim();
 const OWNER_ID = Number(process.env.OWNER_ID || config.ownerId || 0);
 
+// Path Data
 const DATA_DIR = String(process.env.DATA_DIR || '.').trim();
 const SESSION_NAME = String(process.env.SESSION_NAME || config.sessionName || 'session').trim();
+const AUTH_PATH = path.join(DATA_DIR, SESSION_NAME);
+const PREMIUM_PATH = path.join(DATA_DIR, 'premium.json');
 
-// =======================
-// LOGGING & SYSTEM CHECK
-// =======================
-console.log('[BOOT] Starting Application...');
-console.log(`[BOOT] NODE_ENV: ${process.env.NODE_ENV}`);
-console.log(`[BOOT] PORT: ${PORT}`);
-
-// Cek Token
+// Validasi Token
 if (!BOT_TOKEN) {
-  console.error('❌ FATAL: BOT_TOKEN kosong! Set di Environment Variable Koyeb.');
-  process.exit(1); // Exit 1 biar Koyeb tau ini error
+  console.error('❌ FATAL: BOT_TOKEN is missing! Set it in Koyeb Env Vars.');
+  process.exit(1);
 }
 
 // Helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ensureDir = (dir) => { try { fs.mkdirSync(dir, { recursive: true }); } catch {} };
 
-// =======================
-// HEALTH SERVER (PENTING UNTUK KOYEB)
-// =======================
-// Server ini harus jalan duluan biar Koyeb Health Check lulus
+// ==========================================
+// 1. HEALTH SERVER (Koyeb Requirement)
+// ==========================================
 const requestListener = (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Koyeb Health Check: OK');
+  res.end('Koyeb Service is Healthy');
 };
 
 const server = http.createServer(requestListener);
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ [SERVER] HTTP Health Server running on port ${PORT}`);
+  console.log(`✅ [SERVER] Health Check running on port ${PORT}`);
 });
 
-// Keepalive log agar log tidak sepi (opsional)
-setInterval(() => {
-  const memUsage = process.memoryUsage().rss / 1024 / 1024;
-  console.log(`[HEARTBEAT] Alive - Mem: ${memUsage.toFixed(2)} MB`);
-}, 60000); // Tiap 1 menit saja biar ga spam
-
-// =======================
-// DATA STORAGE
-// =======================
-const premiumPath = path.join(DATA_DIR, 'premium.json');
-
+// ==========================================
+// 2. DATA MANAGEMENT (Premium Users)
+// ==========================================
 function readJsonSafe(file, fallback) {
   try {
     if (!fs.existsSync(file)) return fallback;
     return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
+  } catch { return fallback; }
 }
+
 function writeJsonSafe(file, data) {
   try {
     ensureDir(path.dirname(file));
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.log('[WRITE_FAIL]', file, e?.message);
-  }
+  } catch (e) { console.error('[SAVE ERROR]', e.message); }
 }
 
-const getPremiumUsers = () => readJsonSafe(premiumPath, []);
-const savePremiumUsers = (users) => writeJsonSafe(premiumPath, users);
+const getPremiumUsers = () => readJsonSafe(PREMIUM_PATH, []);
+const savePremiumUsers = (users) => writeJsonSafe(PREMIUM_PATH, users);
 
-// =======================
-// WA CONNECTION LOGIC
-// =======================
+// ==========================================
+// 3. WHATSAPP LOGIC (With Auto-Fix)
+// ==========================================
 let waClient = null;
 let waConnectionStatus = 'closed';
 
 async function startWhatsAppClient() {
-  console.log('[WA] Connecting...');
-  
-  const authPath = path.join(DATA_DIR, SESSION_NAME);
-  ensureDir(authPath);
+  console.log('[WA] Initializing...');
+  ensureDir(AUTH_PATH);
 
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
 
   waClient = makeWASocket({
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: false, // Kita pakai pairing code
+    printQRInTerminal: false,
     auth: state,
-    browser: ['Ubuntu', 'Chrome', '20.0.04'], // Browser signature linux biar lebih stabil
-    connectTimeoutMs: 60000, 
+    browser: ['Ubuntu', 'Chrome', '20.0.04'], // Linux signature for stability
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 10000,
+    syncFullHistory: false,
   });
 
   waClient.ev.on('creds.update', saveCreds);
 
-  waClient.ev.on('connection.update', (update) => {
+  waClient.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
-    if (connection) waConnectionStatus = connection;
+    
+    if (connection) {
+        waConnectionStatus = connection;
+        console.log(`[WA] Status Update: ${connection}`);
+    }
 
     if (connection === 'close') {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const error = lastDisconnect?.error;
+      const statusCode = new Boom(error)?.output?.statusCode;
+      
+      console.log(`[WA] Disconnected. Code: ${statusCode}`);
 
-      console.log(`[WA] Connection closed. Code: ${statusCode}. Reconnect: ${shouldReconnect}`);
+      // DETEKSI LOGOUT / SESI RUSAK (401)
+      if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        console.error('❌ [WA] Session Invalid/Logged Out. Menghapus sesi lama...');
+        
+        try {
+            // Hapus folder session
+            if (fs.existsSync(AUTH_PATH)) {
+                fs.rmSync(AUTH_PATH, { recursive: true, force: true });
+                console.log('✅ [WA] Folder sesi berhasil dihapus.');
+            }
+        } catch (e) {
+            console.error('⚠️ [WA] Gagal hapus sesi:', e.message);
+        }
 
-      if (shouldReconnect) {
-        setTimeout(startWhatsAppClient, 5000);
-      } else {
-        console.log('❌ [WA] Logged out / Session invalid. Silakan pairing ulang.');
+        // Restart fresh
+        console.log('🔄 [WA] Restarting client for new pairing...');
         waClient = null;
+        setTimeout(startWhatsAppClient, 3000); 
+
+      } else {
+        // Disconnect biasa, reconnect
+        console.log('🔄 [WA] Reconnecting...');
+        setTimeout(startWhatsAppClient, 5000);
       }
+      
     } else if (connection === 'open') {
-      console.log('✅ [WA] Connected successfully!');
+      console.log('✅ [WA] Connected & Ready!');
     }
   });
 }
 
-// =======================
-// TELEGRAM BOT LOGIC
-// =======================
+// ==========================================
+// 4. TELEGRAM BOT LOGIC
+// ==========================================
 const bot = new Telegraf(BOT_TOKEN);
 
-// Helpers
-function extractNumbers(text) {
-  return String(text || '').match(/\d{6,}/g) || [];
-}
-function fmt(n) {
-  return Number(n || 0).toLocaleString('id-ID');
-}
-function escapeMd(text) {
-  return String(text || '').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-}
+// --- Helpers ---
+function extractNumbers(text) { return String(text || '').match(/\d{6,}/g) || []; }
+function escapeMd(text) { return String(text || '').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&'); }
 
-// Middleware Akses
+// --- Middleware ---
 const checkAccess = (level) => async (ctx, next) => {
   const userId = ctx.from?.id;
   if (!userId) return next();
 
   if (level === 'owner' && userId !== OWNER_ID) {
-    return ctx.reply('🚫 Khusus owner bos!');
+    return ctx.reply('🚫 Akses ditolak: Khusus Owner.');
   }
   if (level === 'premium') {
-    const premiumUsers = getPremiumUsers();
-    if (userId !== OWNER_ID && !premiumUsers.includes(userId)) {
-      return ctx.reply('💎 Fitur Premium. Hubungi owner untuk akses.');
+    const premiums = getPremiumUsers();
+    if (userId !== OWNER_ID && !premiums.includes(userId)) {
+      return ctx.reply('💎 Fitur Premium. Hubungi Owner untuk akses.');
     }
   }
   return next();
 };
 
-// --- Bot Commands ---
+// --- Commands ---
 
 bot.start((ctx) => {
   const name = escapeMd(ctx.from.first_name);
   ctx.reply(
-    `🤖 *Halo ${name}*\n\n` +
-    `Gunakan bot ini untuk cek bio WhatsApp massal.\n\n` +
-    `*Cara Pakai:*\n` +
-    `1. Kirim \`/cekbio 62812xxx 62813xxx\`\n` +
-    `2. Reply file .txt dengan \`/cekbio\`\n` +
-    `3. Upload file .txt dengan caption \`/cekbio\`\n\n` +
-    `_Server: Running on Koyeb_`,
+    `👋 *Halo ${name}*\n\n` +
+    `Bot Cek Bio WhatsApp Massal.\n` +
+    `Status Server: *Online (Koyeb)*\n\n` +
+    `*Commands:*\n` +
+    `1. \`/cekbio <nomor>\` - Cek manual\n` +
+    `2. Reply file .txt dgn \`/cekbio\` - Cek massal\n` +
+    `3. \`/pairing <nomor>\` - (Owner) Login WA\n`,
     { parse_mode: 'Markdown' }
   );
 });
 
 bot.command('pairing', checkAccess('owner'), async (ctx) => {
-  if (!waClient) return ctx.reply('⚠️ Client WA belum siap/error.');
+  if (!waClient) return ctx.reply('⚠️ WA Client sedang restart, tunggu sebentar...');
   
-  const phoneNumber = ctx.message.text.split(' ')[1];
-  if (!phoneNumber) return ctx.reply('Format: /pairing 628xxx');
+  const text = ctx.message.text.split(' ')[1];
+  if (!text) return ctx.reply('Format: /pairing 628xxxxxxxx');
+  const phoneNumber = text.replace(/[^0-9]/g, '');
 
   try {
-    ctx.reply('⏳ Requesting pairing code...');
-    const code = await waClient.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
-    ctx.reply(`📲 Kode Pairing:\n\`${code}\``, { parse_mode: 'Markdown' });
+    ctx.reply('⏳ Meminta kode pairing...');
+    const code = await waClient.requestPairingCode(phoneNumber);
+    ctx.reply(`📲 Kode Pairing Kamu:\n\`${code}\`\n\n_Masukkan di WhatsApp > Perangkat Tertaut_`, { parse_mode: 'Markdown' });
   } catch (e) {
-    ctx.reply(`❌ Gagal: ${e.message}`);
+    ctx.reply(`❌ Gagal request pairing: ${e.message}`);
   }
 });
 
 bot.command(['addakses', 'delakses'], checkAccess('owner'), (ctx) => {
   const cmd = ctx.message.text.split(' ')[0].replace('/', '');
   const targetId = parseInt(ctx.message.text.split(' ')[1]);
+  if (!targetId || isNaN(targetId)) return ctx.reply('Format: /addakses <ID Telegram>');
 
-  if (!targetId || isNaN(targetId)) return ctx.reply('Format: /addakses <ID>');
-  
   let users = getPremiumUsers();
-  
   if (cmd === 'addakses') {
     if (!users.includes(targetId)) users.push(targetId);
     savePremiumUsers(users);
-    ctx.reply(`✅ ID ${targetId} added to Premium.`);
+    ctx.reply(`✅ ID ${targetId} jadi Premium.`);
   } else {
     users = users.filter(id => id !== targetId);
     savePremiumUsers(users);
-    ctx.reply(`✅ ID ${targetId} removed from Premium.`);
+    ctx.reply(`✅ ID ${targetId} dihapus dari Premium.`);
   }
 });
 
-// --- Cek Bio Logic ---
+// --- Logic Cek Bio ---
 async function handleBioCheck(ctx, numbers) {
-  if (waConnectionStatus !== 'open') return ctx.reply('⚠️ WA belum connect. Hubungi admin.');
-  
-  const statusMsg = await ctx.reply(`⏳ Memproses ${numbers.length} nomor...`);
-  
-  const results = {
-    bio: [],
-    noBio: [],
-    notReg: []
-  };
+  if (waConnectionStatus !== 'open') return ctx.reply('⚠️ WhatsApp belum connect. Owner harus /pairing dulu.');
 
-  // Cek Registrasi (Batching 50)
+  const statusMsg = await ctx.reply(`⏳ Memproses ${numbers.length} nomor...`);
   const uniqueNums = [...new Set(numbers)];
   
-  // Progress update helper
+  const results = { bio: [], noBio: [], notReg: [] };
+  
+  // Update log helper
   const updateLog = async (text) => {
     try { await ctx.telegram.editMessageText(statusMsg.chat.id, statusMsg.message_id, undefined, text); } catch {}
   };
 
-  await updateLog(`🔍 Checking registration (${uniqueNums.length})...`);
+  await updateLog(`🔍 Checking registration (${uniqueNums.length} nums)...`);
 
-  // Proses Cek Bio (Sequential Batch biar aman)
-  // Kita batasi batch processing biar memori aman di Koyeb
-  const BATCH_SIZE = 10; 
-  
+  // Batch Processing (Biar Ram Koyeb Aman)
+  const BATCH_SIZE = 15;
   for (let i = 0; i < uniqueNums.length; i += BATCH_SIZE) {
-    const chunk = uniqueNums.slice(i, i + BATCH_SIZE);
+    const batch = uniqueNums.slice(i, i + BATCH_SIZE);
     
-    await Promise.all(chunk.map(async (num) => {
+    await Promise.all(batch.map(async (num) => {
       const jid = num + '@s.whatsapp.net';
       try {
-        // Cek exists dulu
+        // 1. Cek Exists
         const exists = await waClient.onWhatsApp(jid);
         if (!exists || !exists[0]?.exists) {
           results.notReg.push(num);
           return;
         }
-
-        // Fetch Bio
+        // 2. Fetch Status
         const status = await waClient.fetchStatus(jid);
-        const bio = status?.status || status?.status?.text; // Handling struktur beda2
-
-        if (bio) {
-          results.bio.push(`${num} => ${bio}`);
-        } else {
-          results.noBio.push(num);
-        }
-      } catch (e) {
-        // Anggap no bio / privasi kalau error fetch status tapi exists
-        results.noBio.push(num); 
+        const bio = status?.status || status?.status?.text;
+        
+        if (bio) results.bio.push(`${num} => ${bio}`);
+        else results.noBio.push(num);
+      } catch {
+        // Error biasanya karena privasi / tidak ada bio
+        results.noBio.push(num);
       }
     }));
 
-    // Update progress tiap batch
-    if (i % 20 === 0) {
-      await updateLog(`🔄 Progress: ${i + chunk.length}/${uniqueNums.length}\n✅ Bio: ${results.bio.length}`);
+    if (i % 30 === 0) {
+      await updateLog(`🔄 Progress: ${Math.min(i + BATCH_SIZE, uniqueNums.length)}/${uniqueNums.length}\n✅ Found Bio: ${results.bio.length}`);
     }
-    await sleep(50); // Cooling down
+    await sleep(500); // Jeda antar batch
   }
 
-  // Generate File
-  const report = 
+  // Generate Report File
+  const reportContent = 
     `RESULT CEK BIO\n` +
-    `Total: ${uniqueNums.length}\n` +
-    `Ada Bio: ${results.bio.length}\n` +
-    `No Bio/Priv: ${results.noBio.length}\n` +
-    `Not Reg: ${results.notReg.length}\n\n` +
-    `=== WITH BIO ===\n${results.bio.join('\n')}\n\n` +
-    `=== NO BIO ===\n${results.noBio.join('\n')}\n\n` +
-    `=== NOT REG ===\n${results.notReg.join('\n')}`;
+    `Total Check: ${uniqueNums.length}\n` +
+    `✅ With Bio: ${results.bio.length}\n` +
+    `📵 No Bio/Priv: ${results.noBio.length}\n` +
+    `🚫 Not Reg: ${results.notReg.length}\n\n` +
+    `--- DATA BIO ---\n${results.bio.join('\n')}\n\n` +
+    `--- NO BIO ---\n${results.noBio.join('\n')}\n\n` +
+    `--- NOT REG ---\n${results.notReg.join('\n')}`;
 
-  const filename = `result_${Date.now()}.txt`;
-  fs.writeFileSync(filename, report);
+  const filename = `Result_${Date.now()}.txt`;
+  fs.writeFileSync(filename, reportContent);
 
-  await ctx.replyWithDocument({ source: filename, filename: 'Result_CekBio.txt' }, { caption: '✅ Selesai bos.' });
-  fs.unlinkSync(filename);
+  await ctx.replyWithDocument({ source: filename }, { caption: '✅ Done bos.' });
+  try { fs.unlinkSync(filename); } catch {}
 }
 
-// Handle Command Cekbio
 const cekBioHandler = async (ctx) => {
   let text = ctx.message.text || '';
   
-  // Handle file reply
+  // Support Reply File
   if (ctx.message.reply_to_message?.document) {
     const link = await ctx.telegram.getFileLink(ctx.message.reply_to_message.document.file_id);
     const res = await axios.get(link.href, { responseType: 'text' });
     text += ' ' + res.data;
   }
-  // Handle direct file upload
+  // Support Upload File
   if (ctx.message.document) {
      const link = await ctx.telegram.getFileLink(ctx.message.document.file_id);
      const res = await axios.get(link.href, { responseType: 'text' });
@@ -321,53 +308,42 @@ const cekBioHandler = async (ctx) => {
   }
 
   const nums = extractNumbers(text);
-  if (nums.length === 0) return ctx.reply('Mana nomornya/filenya?');
+  if (nums.length === 0) return ctx.reply('⚠️ Mana nomornya? Kirim text atau file txt.');
   
   return handleBioCheck(ctx, nums);
 };
 
 bot.command('cekbio', checkAccess('premium'), cekBioHandler);
 
-// =======================
-// STARTUP SEQUENCE
-// =======================
+// ==========================================
+// 5. MAIN STARTUP
+// ==========================================
 async function main() {
-  try {
-    // 1. Start WA
-    await startWhatsAppClient();
+  // A. Start WA
+  await startWhatsAppClient();
 
-    // 2. Start Telegram
-    console.log('[TG] Launching Bot...');
-    
-    // Hapus webhook lama kalau ada sisa biar ga conflict polling
-    try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch {}
+  // B. Start Telegram
+  console.log('[TG] Starting Telegraf...');
+  try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch {}
+  
+  bot.launch({ dropPendingUpdates: true })
+    .then(() => console.log('✅ [TG] Bot Launched!'))
+    .catch((err) => {
+        console.error('❌ [TG] Launch Failed:', err);
+        process.exit(1); 
+    });
 
-    // Jalankan bot (awaiting launch)
-    bot.launch({ dropPendingUpdates: true })
-      .then(() => {
-        console.log('✅ [TG] Bot Started Successfully!');
-      })
-      .catch((err) => {
-        console.error('❌ [TG] Failed to launch:', err);
-        process.exit(1); // Force restart if TG fails
-      });
-
-    // Handle Graceful Shutdown
-    const stopSignal = (signal) => {
-      console.log(`[STOP] Received ${signal}. Shutting down...`);
-      bot.stop(signal);
-      if (waClient) waClient.end(undefined);
-      server.close();
-      process.exit(0);
-    };
-
-    process.once('SIGINT', () => stopSignal('SIGINT'));
-    process.once('SIGTERM', () => stopSignal('SIGTERM'));
-
-  } catch (error) {
-    console.error('❌ [MAIN] Startup Error:', error);
-    process.exit(1); // Exit 1 triggers Restart in Koyeb
-  }
+  // C. Signal Handling (Graceful Shutdown)
+  const shutdown = (signal) => {
+    console.log(`[STOP] ${signal} received.`);
+    bot.stop(signal);
+    if (waClient) waClient.end(undefined);
+    server.close();
+    process.exit(0);
+  };
+  
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 main();
