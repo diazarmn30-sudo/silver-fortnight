@@ -1,9 +1,22 @@
-// index.js (FULL) — FIX loop Koyeb + FIX Telegraf Conflict (getUpdates hanya boleh 1 instance)
-// - Token: ENV BOT_TOKEN (prioritas) fallback config.telegramBotToken
-// - Health server: listen process.env.PORT (aman walau worker/web)
-// - Anti-exit: kalau Telegraf gagal (Conflict/Unauthorized), process TIDAK exit; retry terus.
-
 'use strict';
+
+// =======================
+// BOOT DEBUG + ANTI EXIT
+// =======================
+const fs = require('fs');
+console.log('[BOOT] file:', __filename);
+console.log('[BOOT] cwd :', process.cwd());
+try { console.log('[BOOT] ls  :', fs.readdirSync('.').slice(0, 25)); } catch {}
+
+process.on("SIGTERM", () => console.log("[SIGNAL] SIGTERM received (platform stopping container)"));
+process.on("SIGINT", () => console.log("[SIGNAL] SIGINT received"));
+process.on("exit", (code) => console.log("[EXIT] code =", code));
+process.on("uncaughtException", (e) => console.log("[UNCAUGHT]", e));
+process.on("unhandledRejection", (e) => console.log("[UNHANDLED]", e));
+
+// paling kebal nahan process
+process.stdin.resume();
+setInterval(() => console.log("[HB] alive", new Date().toISOString()), 15000);
 
 console.log("Memulai bot...");
 console.log("Thank you for using Yuzuki-baileys.");
@@ -15,24 +28,21 @@ const makeWASocket = require("@whiskeysockets/baileys").default;
 const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
-const fs = require("fs");
 const axios = require("axios");
 const path = require("path");
 
 const config = require("./config");
 
 // =======================
-// HEALTH SERVER (biar process hidup + mudah dicek)
+// HEALTH SERVER (AMAN DI KOYEB)
 // =======================
 const PORT = Number(process.env.PORT || 8000);
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("ok");
-  })
-  .listen(PORT, "0.0.0.0", () => {
-    console.log("[HEALTH] listening on", PORT);
-  });
+http.createServer((req, res) => {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("ok");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log("[HEALTH] listening on", PORT);
+});
 
 // =======================
 // TOKEN (ENV > config)
@@ -44,46 +54,36 @@ if (!BOT_TOKEN) {
 }
 
 // =======================
-// DATA DIR (volume persistent kalau ada)
+// DATA DIR
 // =======================
 const DATA_DIR = process.env.DATA_DIR || ".";
 const premiumPath = path.join(DATA_DIR, "premium.json");
 
-// =======================
-// Helpers
-// =======================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ensureDir = (dir) => { try { fs.mkdirSync(dir, { recursive: true }); } catch {} };
 
-const ensureDir = (dir) => {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
-};
-
-const readJsonSafe = (file, fallback) => {
+function readJsonSafe(file, fallback) {
   try {
     if (!fs.existsSync(file)) return fallback;
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
     return fallback;
   }
-};
-
-const writeJsonSafe = (file, data) => {
+}
+function writeJsonSafe(file, data) {
   try {
     ensureDir(path.dirname(file));
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.error("Gagal nulis file:", file, e?.message || e);
+    console.log("[WRITE_FAIL]", file, e?.message || e);
   }
-};
+}
 
-// =======================
-// Premium
-// =======================
 const getPremiumUsers = () => readJsonSafe(premiumPath, []);
 const savePremiumUsers = (users) => writeJsonSafe(premiumPath, users);
 
 // =======================
-// WhatsApp
+// WHATSAPP
 // =======================
 let waClient = null;
 let waConnectionStatus = "closed";
@@ -137,9 +137,7 @@ async function startWhatsAppClient() {
 // =======================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== "open") {
-    return ctx.reply(config.message?.waNotConnected || "WA belum nyambung. /pairing dulu.", {
-      parse_mode: "Markdown",
-    });
+    return ctx.reply(config.message?.waNotConnected || "WA belum nyambung. /pairing dulu.", { parse_mode: "Markdown" });
   }
   if (!numbersToCheck || numbersToCheck.length === 0) return ctx.reply("Nomornya mana, bos?");
 
@@ -168,12 +166,10 @@ async function handleBioCheck(ctx, numbersToCheck) {
       const jid = nomor.trim() + "@s.whatsapp.net";
       try {
         const statusResult = await waClient.fetchStatus(jid);
+        const data = Array.isArray(statusResult) ? statusResult[0] : statusResult;
 
         let bioText = null;
         let setAtText = null;
-
-        // beberapa fork baileys balikin array, jadi handle dua-duanya
-        const data = Array.isArray(statusResult) ? statusResult[0] : statusResult;
 
         if (data) {
           if (typeof data.status === "string") bioText = data.status;
@@ -183,11 +179,9 @@ async function handleBioCheck(ctx, numbersToCheck) {
           setAtText = data.setAt || (data.status && data.status.setAt) || null;
         }
 
-        if (bioText && String(bioText).trim() !== "")
-          withBio.push({ nomor, bio: bioText, setAt: setAtText });
+        if (bioText && String(bioText).trim() !== "") withBio.push({ nomor, bio: bioText, setAt: setAtText });
         else noBio.push(nomor);
       } catch {
-        // kalau fetchStatus error, treat sebagai not registered / no bio
         noBio.push(nomor.trim());
       }
     });
@@ -219,13 +213,12 @@ async function handleBioCheck(ctx, numbersToCheck) {
 
   const filePath = `./hasil_cekbio_By_bos${ctx.from.id}.txt`;
   fs.writeFileSync(filePath, fileContent);
-
   await ctx.replyWithDocument({ source: filePath }, { caption: "Nih hasilnya bos." });
   fs.unlinkSync(filePath);
 }
 
 // =======================
-// TELEGRAM BOT
+// TELEGRAM BOT + COMMANDS
 // =======================
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -343,37 +336,30 @@ bot.command("listallakses", checkAccess("owner"), (ctx) => {
 });
 
 // =======================
-// STARTUP: retry bot.launch() biar gak exit 0 kalau Conflict
+// STARTUP (pasti nahan process)
 // =======================
 async function startAll() {
   await startWhatsAppClient();
 
-  // retry telegram launch sampai sukses (atau token dibenerin)
-  while (true) {
-    try {
-      console.log("Mencoba launch Telegram bot...");
-      await bot.launch();
-      console.log("Telegram bot launched");
-      break;
-    } catch (e) {
-      const msg = e?.response?.description || e?.message || String(e);
-      console.error("Telegraf launch error:", msg);
-
-      // kalau Conflict: artinya ada instance lain jalan.
-      // Tapi kita TETAP hidup & retry, supaya Koyeb gak restart loop.
-      console.log("Retry launch in 15s...");
-      await sleep(15000);
-    }
+  // Launch Telegraf sekali saja. Kalau gagal, jangan exit.
+  // (Kalau token conflict, kamu harus matiin instance lain yang pakai token itu.)
+  try {
+    console.log("[TG] launching...");
+    await bot.launch();
+    console.log("[TG] launched");
+  } catch (e) {
+    const msg = e?.response?.description || e?.message || String(e);
+    console.log("[TG] launch error:", msg);
   }
 
   console.log("𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!");
 
-  // tahan process selamanya (double-lock)
+  // Double-lock biar ga mungkin exit
   await new Promise(() => {});
 }
 
 startAll().catch((e) => {
-  console.error("FATAL:", e);
+  console.log("[FATAL]", e);
   process.exit(1);
 });
 
