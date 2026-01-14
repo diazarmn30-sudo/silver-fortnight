@@ -2,12 +2,16 @@
 
 /**
  * index.js (FULL)
- * - Koyeb safe: keepalive + health server + block process.exit(0)
- * - /cekbio bisa:
- *    A) /cekbio 628xx 62xx ...
- *    B) Reply file .txt lalu ketik: /cekbio
- *    C) Kirim file .txt + caption: /cekbio
- * - (opsional) /cekbiotxt tetap ada (alias lama)
+ * - Koyeb worker safe (health server + keepalive)
+ * - Baileys session persistent via DATA_DIR (/data) + SESSION_NAME
+ * - /cekbio support:
+ *    1) /cekbio 628xx 62xx...
+ *    2) reply .txt + /cekbio
+ *    3) upload .txt with caption /cekbio
+ * - Realtime progress output:
+ *    - message "progress" di Telegram akan di-edit berkala (sedang batch ke berapa, found bio, no bio, not registered)
+ *    - rate-limit biar ga spam edit
+ * - Telegraf polling: dropPendingUpdates + graceful shutdown
  */
 
 const fs = require('fs');
@@ -24,7 +28,7 @@ const pino = require('pino');
 const config = require('./config');
 
 // =======================
-// BOOT DEBUG + SIGNAL LOG
+// LOG / SIGNAL
 // =======================
 console.log('[BOOT] file:', __filename);
 console.log('[BOOT] cwd :', process.cwd());
@@ -37,22 +41,13 @@ process.on('unhandledRejection', (e) => console.log('[UNHANDLED]', e));
 process.on('exit', (code) => console.log('[EXIT] code =', code));
 
 // =======================
-// BLOCK process.exit(0)
-// =======================
-const _exit = process.exit.bind(process);
-process.exit = (code = 0) => {
-  console.log('[BLOCK_EXIT] process.exit(', code, ') blocked');
-  if (process.env.ALLOW_EXIT === '1') return _exit(code);
-};
-
-// =======================
-// HARD KEEPALIVE
+// KEEPALIVE
 // =======================
 process.stdin.resume();
 setInterval(() => console.log('[HB] alive', new Date().toISOString()), 15000);
 
 // =======================
-// HEALTH SERVER (WAJIB)
+// HEALTH SERVER (wajib di Koyeb biar dianggap "alive")
 // =======================
 const PORT = Number(process.env.PORT || 8000);
 http.createServer((req, res) => {
@@ -63,17 +58,18 @@ http.createServer((req, res) => {
 });
 
 // =======================
-// ENV OVERRIDE (ENV > config)
+// ENV (ENV > config)
 // =======================
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || '').trim();
 const OWNER_ID = Number(process.env.OWNER_ID || config.ownerId || 0);
 
-const DATA_DIR = process.env.DATA_DIR || '.';
+// kalau pakai Volume di Koyeb: mount path /data lalu set DATA_DIR=/data
+const DATA_DIR = String(process.env.DATA_DIR || '.').trim();
 const SESSION_NAME = String(process.env.SESSION_NAME || config.sessionName || 'session').trim();
 
 if (!BOT_TOKEN) {
   console.error('FATAL: BOT_TOKEN kosong. Set BOT_TOKEN di Koyeb env atau isi config.telegramBotToken.');
-  _exit(1);
+  process.exit(1);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -97,7 +93,7 @@ function writeJsonSafe(file, data) {
 }
 
 // =======================
-// PREMIUM STORAGE
+// PREMIUM STORAGE (persistent kalau DATA_DIR ke /data)
 // =======================
 const premiumPath = path.join(DATA_DIR, 'premium.json');
 const getPremiumUsers = () => readJsonSafe(premiumPath, []);
@@ -110,7 +106,7 @@ let waClient = null;
 let waConnectionStatus = 'closed';
 
 // =======================
-// START WA
+// START WA (Baileys)
 // =======================
 async function startWhatsAppClient() {
   console.log('Mencoba memulai koneksi WhatsApp...');
@@ -156,10 +152,11 @@ async function startWhatsAppClient() {
 }
 
 // =======================
-// HELPERS: parse numbers
+// HELPERS
 // =======================
 function extractNumbers(text) {
-  return String(text || '').match(/\d{6,}/g) || []; // minimal 6 digit biar gak keambil angka kecil
+  // ambil digit >= 6 biar ga nyangkut "2026" doang
+  return String(text || '').match(/\d{6,}/g) || [];
 }
 
 async function getTxtNumbersFromTelegram(ctx, file_id) {
@@ -168,34 +165,104 @@ async function getTxtNumbersFromTelegram(ctx, file_id) {
   return extractNumbers(resp.data);
 }
 
+function fmt(n) {
+  return Number(n || 0).toLocaleString('id-ID');
+}
+
+function escapeMd(text) {
+  // minimal escape Markdown untuk safe editMessageText
+  return String(text || '')
+    .replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
 // =======================
-// BIO CHECK CORE
+// PROGRESS EDIT (real-time output)
+// =======================
+async function createProgress(ctx, total) {
+  const msg = await ctx.reply(
+    `🧾 *CekBio started*\n` +
+    `Total input: *${fmt(total)}*\n` +
+    `Status: _menyiapkan..._`,
+    { parse_mode: 'Markdown' }
+  );
+
+  return {
+    chatId: msg.chat.id,
+    messageId: msg.message_id,
+    lastEditAt: 0,
+    lastText: '',
+    ended: false,
+  };
+}
+
+async function updateProgress(ctx, p, text, force = false) {
+  if (!p || p.ended) return;
+
+  const now = Date.now();
+  // edit max 1x tiap 2.5 detik biar ga rate-limit
+  if (!force && (now - p.lastEditAt) < 2500) return;
+  if (!force && text === p.lastText) return;
+
+  p.lastEditAt = now;
+  p.lastText = text;
+
+  try {
+    await ctx.telegram.editMessageText(
+      p.chatId,
+      p.messageId,
+      undefined,
+      text,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    // kalau edit gagal (misal message terlalu lama / rate limit), yaudah skip
+    console.log('[PROGRESS] edit fail:', e?.response?.description || e?.message || e);
+  }
+}
+
+async function endProgress(ctx, p, text) {
+  if (!p) return;
+  p.ended = true;
+  await updateProgress(ctx, p, text, true);
+}
+
+// =======================
+// BIO CHECK CORE (dengan realtime output)
 // =======================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== 'open' || !waClient) {
-    return ctx.reply(
-      config.message?.waNotConnected || 'WA belum nyambung. /pairing dulu lah.',
-      { parse_mode: 'Markdown' }
-    );
+    return ctx.reply(config.message?.waNotConnected || '⚠️ WA belum nyambung. /pairing dulu.', { parse_mode: 'Markdown' });
   }
-
   if (!numbersToCheck || numbersToCheck.length === 0) {
-    return ctx.reply('Nomornya mana, bos? (kirim /cekbio 628xx... atau reply/upload .txt + /cekbio)');
+    return ctx.reply('Nomornya mana, bos? (reply/upload .txt + /cekbio juga bisa)');
   }
 
-  await ctx.reply(`Otw bos! ... ngecek ${numbersToCheck.length} nomor.`);
+  const total = numbersToCheck.length;
+  const p = await createProgress(ctx, total);
 
   let withBio = [];
   let noBio = [];
   let notRegistered = [];
 
-  const jids = numbersToCheck.map((num) => String(num).trim() + '@s.whatsapp.net');
+  // cleanup dupes
+  const uniqueNums = Array.from(new Set(numbersToCheck.map((x) => String(x).trim()).filter(Boolean)));
+
+  await updateProgress(
+    ctx, p,
+    `🧾 *CekBio started*\n` +
+    `Total input: *${fmt(total)}*\n` +
+    `Unique: *${fmt(uniqueNums.length)}*\n` +
+    `Status: _cek registrasi WhatsApp..._`
+  );
+
+  const jids = uniqueNums.map((num) => num + '@s.whatsapp.net');
 
   let existenceResults = [];
   try {
     existenceResults = await waClient.onWhatsApp(...jids);
   } catch (e) {
     console.log('[WA] onWhatsApp fail:', e?.message || e);
+    await endProgress(ctx, p, `❌ *Gagal*\nStatus: _cek registrasi WA error_`);
     return ctx.reply('Gagal cek registrasi WA, coba lagi ntar.');
   }
 
@@ -206,13 +273,37 @@ async function handleBioCheck(ctx, numbersToCheck) {
   });
 
   const registeredNumbers = registeredJids.map((jid) => jid.split('@')[0]);
-  const batchSize = Number(config.settings?.cekBioBatchSize || 15);
+
+  const batchSize = Math.max(1, Number(config.settings?.cekBioBatchSize || 15));
+  const totalReg = registeredNumbers.length;
+
+  await updateProgress(
+    ctx, p,
+    `🧾 *CekBio started*\n` +
+    `Total input: *${fmt(total)}* | Unique: *${fmt(uniqueNums.length)}*\n` +
+    `Terdaftar WA: *${fmt(totalReg)}* | Tidak terdaftar: *${fmt(notRegistered.length)}*\n` +
+    `Status: _mulai fetch bio..._`
+  );
+
+  let processed = 0;
+  let batchIndex = 0;
+  const totalBatches = Math.ceil(totalReg / batchSize) || 1;
 
   for (let i = 0; i < registeredNumbers.length; i += batchSize) {
+    batchIndex++;
     const batch = registeredNumbers.slice(i, i + batchSize);
 
+    await updateProgress(
+      ctx, p,
+      `🧾 *CekBio running*\n` +
+      `Batch: *${batchIndex}/${totalBatches}* (size ${batch.length})\n` +
+      `Progress: *${fmt(processed)}/${fmt(totalReg)}*\n` +
+      `✅ Bio: *${fmt(withBio.length)}* | 📵 NoBio: *${fmt(noBio.length)}* | 🚫 NotReg: *${fmt(notRegistered.length)}*\n` +
+      `Status: _fetch bio batch ${batchIndex}..._`
+    );
+
     const promises = batch.map(async (nomor) => {
-      const jid = nomor.trim() + '@s.whatsapp.net';
+      const jid = nomor + '@s.whatsapp.net';
       try {
         const statusResult = await waClient.fetchStatus(jid);
         const data = Array.isArray(statusResult) ? statusResult[0] : statusResult;
@@ -228,23 +319,51 @@ async function handleBioCheck(ctx, numbersToCheck) {
           setAtText = data.setAt || (data.status && data.status.setAt) || null;
         }
 
-        if (bioText && String(bioText).trim() !== '') withBio.push({ nomor, bio: bioText, setAt: setAtText });
-        else noBio.push(nomor);
+        if (bioText && String(bioText).trim() !== '') {
+          withBio.push({ nomor, bio: bioText, setAt: setAtText });
+        } else {
+          noBio.push(nomor);
+        }
       } catch {
-        noBio.push(nomor.trim());
+        noBio.push(nomor);
+      } finally {
+        processed++;
       }
     });
 
     await Promise.allSettled(promises);
-    await sleep(800);
+
+    await updateProgress(
+      ctx, p,
+      `🧾 *CekBio running*\n` +
+      `Batch: *${batchIndex}/${totalBatches}* selesai\n` +
+      `Progress: *${fmt(processed)}/${fmt(totalReg)}*\n` +
+      `✅ Bio: *${fmt(withBio.length)}* | 📵 NoBio: *${fmt(noBio.length)}* | 🚫 NotReg: *${fmt(notRegistered.length)}*\n` +
+      `Status: _cooldown..._`
+    );
+
+    // delay kecil biar WA ga kebakar
+    await sleep(50);
   }
 
-  // output txt
+  // =======================
+  // OUTPUT FILE
+  // =======================
+  await updateProgress(
+    ctx, p,
+    `🧾 *CekBio finishing*\n` +
+    `Progress: *${fmt(processed)}/${fmt(totalReg)}*\n` +
+    `✅ Bio: *${fmt(withBio.length)}* | 📵 NoBio: *${fmt(noBio.length)}* | 🚫 NotReg: *${fmt(notRegistered.length)}*\n` +
+    `Status: _buat file hasil..._`
+  );
+
   let fileContent = 'NIH bos HASIL CEK BIO SEMUA USER\n\n';
-  fileContent += `✅ Total nomor dicek : ${numbersToCheck.length}\n`;
-  fileContent += `📳 Dengan Bio       : ${withBio.length}\n`;
-  fileContent += `📵 Tanpa Bio        : ${noBio.length}\n`;
-  fileContent += `🚫 Tidak Terdaftar  : ${notRegistered.length}\n\n`;
+  fileContent += `✅ Total input        : ${fmt(total)}\n`;
+  fileContent += `🧠 Unique            : ${fmt(uniqueNums.length)}\n`;
+  fileContent += `📳 Terdaftar WA      : ${fmt(totalReg)}\n`;
+  fileContent += `🚫 Tidak terdaftar   : ${fmt(notRegistered.length)}\n`;
+  fileContent += `✅ Dengan Bio        : ${fmt(withBio.length)}\n`;
+  fileContent += `📵 Tanpa Bio/privasi : ${fmt(noBio.length)}\n\n`;
 
   fileContent += `----------------------------------------\n\n`;
   fileContent += `✅ NOMOR DENGAN BIO (${withBio.length})\n\n`;
@@ -261,8 +380,20 @@ async function handleBioCheck(ctx, numbersToCheck) {
   fileContent += `📵 NOMOR TANPA BIO / PRIVASI (${noBio.length})\n\n`;
   fileContent += noBio.length ? noBio.join('\n') + '\n' : '(Kosong)\n';
 
-  const outPath = `./hasil_cekbio_By_bos${ctx.from.id}.txt`;
+  fileContent += `\n----------------------------------------\n\n`;
+  fileContent += `🚫 TIDAK TERDAFTAR WA (${notRegistered.length})\n\n`;
+  fileContent += notRegistered.length ? notRegistered.join('\n') + '\n' : '(Kosong)\n';
+
+  const outPath = `./hasil_cekbio_By_${ctx.from.id}.txt`;
   fs.writeFileSync(outPath, fileContent);
+
+  await endProgress(
+    ctx, p,
+    `✅ *CekBio selesai*\n` +
+    `Total input: *${fmt(total)}* | Unique: *${fmt(uniqueNums.length)}*\n` +
+    `✅ Bio: *${fmt(withBio.length)}* | 📵 NoBio: *${fmt(noBio.length)}* | 🚫 NotReg: *${fmt(notRegistered.length)}*\n` +
+    `Status: _mengirim file..._`
+  );
 
   await ctx.replyWithDocument({ source: outPath }, { caption: 'Nih hasilnya bos.' });
   try { fs.unlinkSync(outPath); } catch {}
@@ -271,24 +402,20 @@ async function handleBioCheck(ctx, numbersToCheck) {
 // =======================
 // TELEGRAM BOT
 // =======================
-console.log('Memulai bot...');
-console.log('Thank you for using Yuzuki-baileys.');
-console.log('Read apis api.kriszzyy.xyz');
-
 const bot = new Telegraf(BOT_TOKEN);
 
 const checkAccess = (level) => async (ctx, next) => {
   const userId = ctx.from?.id;
 
   if (level === 'owner' && userId !== OWNER_ID) {
-    return ctx.reply(config.message?.owner || 'Khusus owner, bos!', { parse_mode: 'Markdown' });
+    return ctx.reply(config.message?.owner || '🚫 Khusus owner, bos!', { parse_mode: 'Markdown' });
   }
 
   if (level === 'premium') {
     const premiumUsers = getPremiumUsers();
     const isPremium = premiumUsers.includes(userId);
     if (userId !== OWNER_ID && !isPremium) {
-      return ctx.reply(config.message?.premium || 'Khusus member premium, bos!', { parse_mode: 'Markdown' });
+      return ctx.reply(config.message?.premium || '💎 Khusus member premium, bos!', { parse_mode: 'Markdown' });
     }
   }
 
@@ -297,65 +424,49 @@ const checkAccess = (level) => async (ctx, next) => {
 
 bot.command('start', (ctx) => {
   const userName = ctx.from?.first_name || 'bos';
-  const caption = `🕊 *(!) Holà ${userName}!*
-━━━━━━━━━━━━━━━━━━━━━━━━
-⬡ Prefix : /
-⬡ Status : ON
+  const caption =
+    `🕊 *Holà ${escapeMd(userName)}!*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `✅ /cekbio 628xx 62xx ...\n` +
+    `✅ Reply file .txt + /cekbio\n` +
+    `✅ Upload file .txt + caption /cekbio\n\n` +
+    `Owner:\n` +
+    `- /pairing 628xxxx\n` +
+    `- /addakses <id>\n` +
+    `- /delakses <id>\n` +
+    `- /listallakses\n`;
 
-😮‍💨 *FITUR UTAMA*
-/cekbio <Nomor1> <Nomor2> ...
-✅ Bisa juga:
-- Reply file .txt lalu ketik: /cekbio
-- Kirim file .txt + caption: /cekbio
-
-🕊 *KHUSUS OWNER*
-/pairing <Nomor>
-/addakses <Id_User>
-/delakses <Id_User>
-/listallakses
-━━━━━━━━━━━━━━━━━━━━━━━━`;
-
-  if (config.photoStart) {
-    return ctx.replyWithPhoto({ url: config.photoStart }, { caption, parse_mode: 'Markdown' });
-  }
+  if (config.photoStart) return ctx.replyWithPhoto({ url: config.photoStart }, { caption, parse_mode: 'Markdown' });
   return ctx.reply(caption, { parse_mode: 'Markdown' });
 });
 
 bot.command('pairing', checkAccess('owner'), async (ctx) => {
   const phoneNumber = ctx.message?.text?.split(' ')[1]?.replace(/[^0-9]/g, '');
-  if (!phoneNumber) return ctx.reply('Format salah.\nContoh: /pairing 62812...');
-  if (!waClient) return ctx.reply('Koneksi WA lagi down bos, sabar bentar.');
+  if (!phoneNumber) return ctx.reply('Format: /pairing 62812...');
+  if (!waClient) return ctx.reply('WA lagi down bos.');
 
   try {
-    await ctx.reply('Otw minta kode pairing bos...');
+    await ctx.reply('Otw minta pairing code...');
     const code = await waClient.requestPairingCode(phoneNumber);
     await ctx.reply(
-      `📲 Nih kodenya bos: *${code}*\n\nMasukin di WA:\n*Tautkan Perangkat > Tautkan dengan nomor telepon*`,
+      `📲 Kode: *${escapeMd(code)}*\nMasukin di WA: *Tautkan Perangkat > Tautkan dengan nomor telepon*`,
       { parse_mode: 'Markdown' }
     );
   } catch (e) {
-    console.error('Gagal pairing:', e);
-    await ctx.reply('Gagal minta pairing code, bos. Coba lagi ntar.');
+    console.log('[pairing] fail:', e?.message || e);
+    await ctx.reply('Gagal minta pairing code.');
   }
 });
 
-/**
- * /cekbio:
- * - kalau ada angka di command -> pakai angka itu
- * - else kalau reply dokumen .txt -> ambil angka dari file itu
- * - else kalau message punya document .txt (upload + caption /cekbio) -> ambil angka dari file itu
- */
 bot.command('cekbio', checkAccess('premium'), async (ctx) => {
   try {
     const text = ctx.message?.text || '';
     const inlineNums = extractNumbers(text);
 
-    // 1) /cekbio 628xx ...
-    if (inlineNums.length > 0) {
-      return handleBioCheck(ctx, inlineNums);
-    }
+    // 1) /cekbio 628xx 62xx
+    if (inlineNums.length > 0) return handleBioCheck(ctx, inlineNums);
 
-    // 2) Reply dokumen .txt + /cekbio
+    // 2) reply .txt + /cekbio
     const replied = ctx.message?.reply_to_message;
     if (replied?.document) {
       const doc = replied.document;
@@ -364,7 +475,7 @@ bot.command('cekbio', checkAccess('premium'), async (ctx) => {
       return handleBioCheck(ctx, nums);
     }
 
-    // 3) Upload file .txt + caption /cekbio
+    // 3) upload .txt + caption /cekbio
     if (ctx.message?.document) {
       const doc = ctx.message.document;
       if (doc.mime_type !== 'text/plain') return ctx.reply('Filenya harus .txt bos.');
@@ -372,34 +483,27 @@ bot.command('cekbio', checkAccess('premium'), async (ctx) => {
       return handleBioCheck(ctx, nums);
     }
 
-    return ctx.reply('Kirim: /cekbio 628xx ... atau reply/upload file .txt + /cekbio');
+    return ctx.reply('Kirim: /cekbio 628xx... atau reply/upload file .txt + /cekbio');
   } catch (e) {
     console.log('[cekbio] error:', e?.message || e);
-    return ctx.reply('Error pas proses /cekbio, coba lagi.');
+    return ctx.reply('Error pas proses /cekbio.');
   }
 });
 
-// Alias lama (biar kompatibel)
+// alias lama (kalau mau tetap ada)
 bot.command('cekbiotxt', checkAccess('premium'), async (ctx) => {
   const replied = ctx.message?.reply_to_message;
-  if (!replied?.document) return ctx.reply('Reply file .txt nya dulu, bos.');
-
+  if (!replied?.document) return ctx.reply('Reply file .txt dulu.');
   const doc = replied.document;
   if (doc.mime_type !== 'text/plain') return ctx.reply('Filenya harus .txt.');
-
-  try {
-    const numbersToCheck = await getTxtNumbersFromTelegram(ctx, doc.file_id);
-    await handleBioCheck(ctx, numbersToCheck);
-  } catch (error) {
-    console.error('Gagal proses file:', error);
-    ctx.reply('Gagal ngambil nomor dari file, coba lagi.');
-  }
+  const nums = await getTxtNumbersFromTelegram(ctx, doc.file_id);
+  return handleBioCheck(ctx, nums);
 });
 
 bot.command(['addakses', 'delakses'], checkAccess('owner'), (ctx) => {
   const cmd = ctx.message?.text?.split(' ')[0].slice(1);
   const targetId = parseInt(ctx.message?.text?.split(' ')[1], 10);
-  if (isNaN(targetId)) return ctx.reply('ID-nya angka, bos.');
+  if (isNaN(targetId)) return ctx.reply('ID harus angka.');
 
   let premiumUsers = getPremiumUsers();
 
@@ -413,37 +517,46 @@ bot.command(['addakses', 'delakses'], checkAccess('owner'), (ctx) => {
   if (!premiumUsers.includes(targetId)) return ctx.reply(`ID ${targetId} bukan premium.`);
   premiumUsers = premiumUsers.filter((id) => id !== targetId);
   savePremiumUsers(premiumUsers);
-  return ctx.reply(`✅ ID ${targetId} udah dicabut.`);
+  return ctx.reply(`✅ ID ${targetId} dicabut.`);
 });
 
 bot.command('listallakses', checkAccess('owner'), (ctx) => {
   const premiumUsers = getPremiumUsers();
-  if (premiumUsers.length === 0) return ctx.reply('Belum ada member premium, bos.');
-
-  let text = '*Nih daftar member premium:*\n';
-  premiumUsers.forEach((id) => (text += `- ${id}\n`));
-  return ctx.reply(text, { parse_mode: 'Markdown' });
+  if (premiumUsers.length === 0) return ctx.reply('Belum ada member premium.');
+  return ctx.reply(`*Daftar premium:*\n${premiumUsers.map((x) => `- ${x}`).join('\n')}`, { parse_mode: 'Markdown' });
 });
 
 // =======================
 // STARTUP
 // =======================
 async function startAll() {
+  console.log('Memulai bot...');
+
   await startWhatsAppClient();
 
   console.log('[TG] launching...');
-  bot.launch()
+  bot.launch({ dropPendingUpdates: true })
     .then(() => console.log('[TG] launched OK'))
     .catch((e) => console.log('[TG] launch error:', e?.response?.description || e?.message || e));
 
-  console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
-  await new Promise(() => {});
+  console.log('RUNNING...');
+  await new Promise(() => {}); // keep alive forever
 }
 
 startAll().catch((e) => {
   console.log('[FATAL]', e);
-  _exit(1);
+  process.exit(1);
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Stop bersih (biar polling berhenti sebelum instance baru start)
+async function gracefulShutdown(sig) {
+  console.log('[SHUTDOWN] start by', sig);
+  try { bot.stop(sig); } catch {}
+  try { waClient?.end?.(); } catch {}
+  await sleep(800);
+  console.log('[SHUTDOWN] done');
+  process.exit(0);
+}
+
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
