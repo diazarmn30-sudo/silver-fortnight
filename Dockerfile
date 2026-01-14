@@ -1,8 +1,9 @@
+# Dockerfile (FULL)
 FROM node:20-alpine
 
 WORKDIR /app
 
-# wajib: git (npm perlu git kalau dependency github:)
+# npm butuh git kalau ada dependency dari github
 RUN apk add --no-cache git
 
 COPY package*.json ./
