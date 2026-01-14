@@ -1,15 +1,15 @@
-# Dockerfile (FULL)
 FROM node:20-alpine
 
 WORKDIR /app
 
-# npm butuh git kalau ada dependency dari github
-RUN apk add --no-cache git
-
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 COPY . .
 
 ENV NODE_ENV=production
+ENV PORT=8000
+
+EXPOSE 8000
+
 CMD ["node", "index.js"]
