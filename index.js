@@ -2,13 +2,12 @@
 
 /**
  * index.js (FULL)
- * - Anti-loop Koyeb (jaga process tetap hidup)
- * - Debug signal/exit
- * - Block process.exit(0) biar ketahuan siapa yang nyoba matiin
- * - Health server listen di PORT (wajib biar runtime “aktif”)
- * - Telegram (Telegraf) launch non-blocking + log jelas
- * - WhatsApp (Baileys) auto reconnect
- * - fitur cekbio / cekbiotxt / pairing / addakses / delakses / listallakses
+ * - Koyeb safe: keepalive + health server + block process.exit(0)
+ * - /cekbio bisa:
+ *    A) /cekbio 628xx 62xx ...
+ *    B) Reply file .txt lalu ketik: /cekbio
+ *    C) Kirim file .txt + caption: /cekbio
+ * - (opsional) /cekbiotxt tetap ada (alias lama)
  */
 
 const fs = require('fs');
@@ -44,13 +43,12 @@ const _exit = process.exit.bind(process);
 process.exit = (code = 0) => {
   console.log('[BLOCK_EXIT] process.exit(', code, ') blocked');
   if (process.env.ALLOW_EXIT === '1') return _exit(code);
-  // block keluar supaya ga loop restart
 };
 
 // =======================
 // HARD KEEPALIVE
 // =======================
-process.stdin.resume(); // paling kebal nahan process
+process.stdin.resume();
 setInterval(() => console.log('[HB] alive', new Date().toISOString()), 15000);
 
 // =======================
@@ -76,9 +74,6 @@ const SESSION_NAME = String(process.env.SESSION_NAME || config.sessionName || 's
 if (!BOT_TOKEN) {
   console.error('FATAL: BOT_TOKEN kosong. Set BOT_TOKEN di Koyeb env atau isi config.telegramBotToken.');
   _exit(1);
-}
-if (!OWNER_ID) {
-  console.log('WARN: OWNER_ID kosong (owner feature akan ga jalan bener). Set OWNER_ID atau config.ownerId.');
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -161,14 +156,32 @@ async function startWhatsAppClient() {
 }
 
 // =======================
+// HELPERS: parse numbers
+// =======================
+function extractNumbers(text) {
+  return String(text || '').match(/\d{6,}/g) || []; // minimal 6 digit biar gak keambil angka kecil
+}
+
+async function getTxtNumbersFromTelegram(ctx, file_id) {
+  const link = await ctx.telegram.getFileLink(file_id);
+  const resp = await axios.get(link.href, { responseType: 'text' });
+  return extractNumbers(resp.data);
+}
+
+// =======================
 // BIO CHECK CORE
 // =======================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== 'open' || !waClient) {
-    return ctx.reply(config.message?.waNotConnected || 'WA belum nyambung. /pairing dulu lah.', { parse_mode: 'Markdown' });
+    return ctx.reply(
+      config.message?.waNotConnected || 'WA belum nyambung. /pairing dulu lah.',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  if (!numbersToCheck || numbersToCheck.length === 0) return ctx.reply('Nomornya mana, bos?');
+  if (!numbersToCheck || numbersToCheck.length === 0) {
+    return ctx.reply('Nomornya mana, bos? (kirim /cekbio 628xx... atau reply/upload .txt + /cekbio)');
+  }
 
   await ctx.reply(`Otw bos! ... ngecek ${numbersToCheck.length} nomor.`);
 
@@ -291,7 +304,9 @@ bot.command('start', (ctx) => {
 
 😮‍💨 *FITUR UTAMA*
 /cekbio <Nomor1> <Nomor2> ...
-/cekbiotxt (Reply File .txt)
+✅ Bisa juga:
+- Reply file .txt lalu ketik: /cekbio
+- Kirim file .txt + caption: /cekbio
 
 🕊 *KHUSUS OWNER*
 /pairing <Nomor>
@@ -324,11 +339,47 @@ bot.command('pairing', checkAccess('owner'), async (ctx) => {
   }
 });
 
+/**
+ * /cekbio:
+ * - kalau ada angka di command -> pakai angka itu
+ * - else kalau reply dokumen .txt -> ambil angka dari file itu
+ * - else kalau message punya document .txt (upload + caption /cekbio) -> ambil angka dari file itu
+ */
 bot.command('cekbio', checkAccess('premium'), async (ctx) => {
-  const numbersToCheck = ctx.message?.text?.split(' ').slice(1).join(' ').match(/\d+/g) || [];
-  await handleBioCheck(ctx, numbersToCheck);
+  try {
+    const text = ctx.message?.text || '';
+    const inlineNums = extractNumbers(text);
+
+    // 1) /cekbio 628xx ...
+    if (inlineNums.length > 0) {
+      return handleBioCheck(ctx, inlineNums);
+    }
+
+    // 2) Reply dokumen .txt + /cekbio
+    const replied = ctx.message?.reply_to_message;
+    if (replied?.document) {
+      const doc = replied.document;
+      if (doc.mime_type !== 'text/plain') return ctx.reply('Reply file .txt ya bos.');
+      const nums = await getTxtNumbersFromTelegram(ctx, doc.file_id);
+      return handleBioCheck(ctx, nums);
+    }
+
+    // 3) Upload file .txt + caption /cekbio
+    if (ctx.message?.document) {
+      const doc = ctx.message.document;
+      if (doc.mime_type !== 'text/plain') return ctx.reply('Filenya harus .txt bos.');
+      const nums = await getTxtNumbersFromTelegram(ctx, doc.file_id);
+      return handleBioCheck(ctx, nums);
+    }
+
+    return ctx.reply('Kirim: /cekbio 628xx ... atau reply/upload file .txt + /cekbio');
+  } catch (e) {
+    console.log('[cekbio] error:', e?.message || e);
+    return ctx.reply('Error pas proses /cekbio, coba lagi.');
+  }
 });
 
+// Alias lama (biar kompatibel)
 bot.command('cekbiotxt', checkAccess('premium'), async (ctx) => {
   const replied = ctx.message?.reply_to_message;
   if (!replied?.document) return ctx.reply('Reply file .txt nya dulu, bos.');
@@ -337,9 +388,7 @@ bot.command('cekbiotxt', checkAccess('premium'), async (ctx) => {
   if (doc.mime_type !== 'text/plain') return ctx.reply('Filenya harus .txt.');
 
   try {
-    const fileLink = await ctx.telegram.getFileLink(doc.file_id);
-    const response = await axios.get(fileLink.href);
-    const numbersToCheck = String(response.data || '').match(/\d+/g) || [];
+    const numbersToCheck = await getTxtNumbersFromTelegram(ctx, doc.file_id);
     await handleBioCheck(ctx, numbersToCheck);
   } catch (error) {
     console.error('Gagal proses file:', error);
@@ -380,18 +429,14 @@ bot.command('listallakses', checkAccess('owner'), (ctx) => {
 // STARTUP
 // =======================
 async function startAll() {
-  // WA
   await startWhatsAppClient();
 
-  // TG (NON-BLOCKING)
   console.log('[TG] launching...');
   bot.launch()
     .then(() => console.log('[TG] launched OK'))
     .catch((e) => console.log('[TG] launch error:', e?.response?.description || e?.message || e));
 
   console.log('𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!');
-
-  // tahan selamanya
   await new Promise(() => {});
 }
 
@@ -400,6 +445,6 @@ startAll().catch((e) => {
   _exit(1);
 });
 
-// stop hooks
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+```0
