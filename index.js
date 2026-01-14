@@ -1,7 +1,15 @@
+// index.js (FULL) — FIX loop Koyeb + FIX Telegraf Conflict (getUpdates hanya boleh 1 instance)
+// - Token: ENV BOT_TOKEN (prioritas) fallback config.telegramBotToken
+// - Health server: listen process.env.PORT (aman walau worker/web)
+// - Anti-exit: kalau Telegraf gagal (Conflict/Unauthorized), process TIDAK exit; retry terus.
+
 'use strict';
 
 console.log("Memulai bot...");
+console.log("Thank you for using Yuzuki-baileys.");
+console.log("Read apis api.kriszzyy.xyz");
 
+const http = require("http");
 const { Telegraf } = require("telegraf");
 const makeWASocket = require("@whiskeysockets/baileys").default;
 const { useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
@@ -10,67 +18,84 @@ const pino = require("pino");
 const fs = require("fs");
 const axios = require("axios");
 const path = require("path");
-const http = require("http");
 
 const config = require("./config");
 
-// ==========================
-// HEALTH SERVER (BIAR KOYEB GA NGIRA APP MATI)
-// ==========================
+// =======================
+// HEALTH SERVER (biar process hidup + mudah dicek)
+// =======================
 const PORT = Number(process.env.PORT || 8000);
-http.createServer((req, res) => {
-  res.writeHead(200, { "content-type": "text/plain" });
-  res.end("ok");
-}).listen(PORT, () => {
-  console.log("[HEALTH] listening on", PORT);
-});
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+  })
+  .listen(PORT, "0.0.0.0", () => {
+    console.log("[HEALTH] listening on", PORT);
+  });
 
-// ==========================
-// TOKEN (ENV PRIORITAS)
-// ==========================
+// =======================
+// TOKEN (ENV > config)
+// =======================
 const BOT_TOKEN = String(process.env.BOT_TOKEN || config.telegramBotToken || "").trim();
 if (!BOT_TOKEN) {
-  console.error("TOKEN BOT Telegram kosong. Set BOT_TOKEN di Koyeb Secrets atau isi config.telegramBotToken.");
+  console.error("FATAL: BOT_TOKEN kosong. Set BOT_TOKEN di Koyeb Secrets atau isi config.telegramBotToken.");
   process.exit(1);
 }
 
-// ==========================
-// DATA DIR (Koyeb volume: /data) - optional
-// ==========================
+// =======================
+// DATA DIR (volume persistent kalau ada)
+// =======================
 const DATA_DIR = process.env.DATA_DIR || ".";
 const premiumPath = path.join(DATA_DIR, "premium.json");
 
-// Keep-alive ekstra (ga wajib karena ada server, tapi aman)
-setInterval(() => {}, 1 << 30);
+// =======================
+// Helpers
+// =======================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ==========================
-// Premium helpers
-// ==========================
-const getPremiumUsers = () => {
+const ensureDir = (dir) => {
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+};
+
+const readJsonSafe = (file, fallback) => {
   try {
-    return JSON.parse(fs.readFileSync(premiumPath, "utf8"));
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
-    try { fs.writeFileSync(premiumPath, "[]"); } catch {}
-    return [];
+    return fallback;
   }
 };
 
-const savePremiumUsers = (users) => {
-  fs.writeFileSync(premiumPath, JSON.stringify(users, null, 2));
+const writeJsonSafe = (file, data) => {
+  try {
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("Gagal nulis file:", file, e?.message || e);
+  }
 };
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// =======================
+// Premium
+// =======================
+const getPremiumUsers = () => readJsonSafe(premiumPath, []);
+const savePremiumUsers = (users) => writeJsonSafe(premiumPath, users);
 
-// ==========================
-// WhatsApp client
-// ==========================
+// =======================
+// WhatsApp
+// =======================
 let waClient = null;
 let waConnectionStatus = "closed";
 
 async function startWhatsAppClient() {
   console.log("Mencoba memulai koneksi WhatsApp...");
 
-  const { state, saveCreds } = await useMultiFileAuthState(path.join(DATA_DIR, config.sessionName));
+  const sessionName = process.env.SESSION_NAME || config.sessionName || "session";
+  const authPath = path.join(DATA_DIR, sessionName);
+  ensureDir(authPath);
+
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
 
   waClient = makeWASocket({
     logger: pino({ level: "silent" }),
@@ -83,7 +108,7 @@ async function startWhatsAppClient() {
 
   waClient.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect } = update;
-    waConnectionStatus = connection;
+    if (connection) waConnectionStatus = connection;
 
     if (connection === "close") {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
@@ -107,16 +132,15 @@ async function startWhatsAppClient() {
   });
 }
 
-// ==========================
-// Core cek bio
-// ==========================
+// =======================
+// CEK BIO
+// =======================
 async function handleBioCheck(ctx, numbersToCheck) {
   if (waConnectionStatus !== "open") {
     return ctx.reply(config.message?.waNotConnected || "WA belum nyambung. /pairing dulu.", {
       parse_mode: "Markdown",
     });
   }
-
   if (!numbersToCheck || numbersToCheck.length === 0) return ctx.reply("Nomornya mana, bos?");
 
   await ctx.reply(`Otw bos! ... ngecek ${numbersToCheck.length} nomor.`);
@@ -148,21 +172,23 @@ async function handleBioCheck(ctx, numbersToCheck) {
         let bioText = null;
         let setAtText = null;
 
-        if (Array.isArray(statusResult) && statusResult.length > 0) {
-          const data = statusResult[0];
-          if (data) {
-            if (typeof data.status === "string") bioText = data.status;
-            else if (typeof data.status === "object" && data.status !== null)
-              bioText = data.status.text || data.status.status;
+        // beberapa fork baileys balikin array, jadi handle dua-duanya
+        const data = Array.isArray(statusResult) ? statusResult[0] : statusResult;
 
-            setAtText = data.setAt || (data.status && data.status.setAt);
-          }
+        if (data) {
+          if (typeof data.status === "string") bioText = data.status;
+          else if (typeof data.status === "object" && data.status !== null)
+            bioText = data.status.text || data.status.status;
+
+          setAtText = data.setAt || (data.status && data.status.setAt) || null;
         }
 
-        if (bioText && bioText.trim() !== "") withBio.push({ nomor, bio: bioText, setAt: setAtText });
+        if (bioText && String(bioText).trim() !== "")
+          withBio.push({ nomor, bio: bioText, setAt: setAtText });
         else noBio.push(nomor);
       } catch {
-        notRegistered.push(nomor.trim());
+        // kalau fetchStatus error, treat sebagai not registered / no bio
+        noBio.push(nomor.trim());
       }
     });
 
@@ -198,9 +224,9 @@ async function handleBioCheck(ctx, numbersToCheck) {
   fs.unlinkSync(filePath);
 }
 
-// ==========================
-// Telegram bot
-// ==========================
+// =======================
+// TELEGRAM BOT
+// =======================
 const bot = new Telegraf(BOT_TOKEN);
 
 const checkAccess = (level) => async (ctx, next) => {
@@ -279,7 +305,7 @@ bot.command("cekbiotxt", checkAccess("premium"), async (ctx) => {
   try {
     const fileLink = await ctx.telegram.getFileLink(doc.file_id);
     const response = await axios.get(fileLink.href);
-    const numbersToCheck = response.data.match(/\d+/g) || [];
+    const numbersToCheck = String(response.data || "").match(/\d+/g) || [];
     await handleBioCheck(ctx, numbersToCheck);
   } catch (error) {
     console.error("Gagal proses file:", error);
@@ -316,22 +342,37 @@ bot.command("listallakses", checkAccess("owner"), (ctx) => {
   return ctx.reply(text, { parse_mode: "Markdown" });
 });
 
-// ==========================
-// Startup
-// ==========================
-(async () => {
+// =======================
+// STARTUP: retry bot.launch() biar gak exit 0 kalau Conflict
+// =======================
+async function startAll() {
   await startWhatsAppClient();
 
-  try {
-    await bot.launch();
-    console.log("Telegram bot launched");
-  } catch (e) {
-    const msg = e?.response?.description || e?.message || String(e);
-    console.error("Telegraf launch error:", msg);
+  // retry telegram launch sampai sukses (atau token dibenerin)
+  while (true) {
+    try {
+      console.log("Mencoba launch Telegram bot...");
+      await bot.launch();
+      console.log("Telegram bot launched");
+      break;
+    } catch (e) {
+      const msg = e?.response?.description || e?.message || String(e);
+      console.error("Telegraf launch error:", msg);
+
+      // kalau Conflict: artinya ada instance lain jalan.
+      // Tapi kita TETAP hidup & retry, supaya Koyeb gak restart loop.
+      console.log("Retry launch in 15s...");
+      await sleep(15000);
+    }
   }
 
   console.log("𝗗𝗛 𝗢𝗡 𝗕𝗔𝗭𝗭 𝗚𝗔𝗦𝗦 𝗖𝗘𝗞!!!");
-})().catch((e) => {
+
+  // tahan process selamanya (double-lock)
+  await new Promise(() => {});
+}
+
+startAll().catch((e) => {
   console.error("FATAL:", e);
   process.exit(1);
 });
