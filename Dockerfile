@@ -2,18 +2,15 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# biar dependency yang butuh git ga error (kalau ada dep dari github)
+# perlu git kalau ada dependency yang narik dari git url
 RUN apk add --no-cache git
 
-COPY package.json ./
-
-# ga pake npm ci karena ga ada package-lock.json
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package*.json ./
+RUN npm install --omit=dev
 
 COPY . .
 
 ENV NODE_ENV=production
-ENV PORT=8000
 EXPOSE 8000
 
 CMD ["node", "index.js"]
